@@ -1,0 +1,46 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "crm-rafael",
+  "main": "src/worker/index.ts",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["nodejs_compat"],
+
+  // Front (React + Vite) servido como static assets na mesma origem da API.
+  // /api/* sempre passa pelo Worker; o resto cai no SPA (index.html).
+  "assets": {
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*"]
+  },
+
+  // Sem IDs de proposito: o `wrangler deploy` reaproveita os recursos com estes nomes na conta logada
+  // ou cria os que faltam (provisionamento automatico). Assim o repositorio serve para qualquer conta.
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "crm-atendimentozap",
+      "migrations_dir": "migrations","database_id": "c3ce9a4b-90ad-4560-b83b-b9a889aa8ca2"
+    }
+  ],
+
+  "r2_buckets": [{ "binding": "MEDIA", "bucket_name": "crm-simples-media","preview_bucket_name": "crm-simples-media" }],
+
+  "queues": {
+    "producers": [{ "binding": "MEDIA_QUEUE", "queue": "crm-simples-media" }],
+    "consumers": [
+      {
+        "queue": "crm-simples-media",
+        "max_retries": 5,
+        "dead_letter_queue": "crm-simples-media-dlq"
+      }
+    ]
+  },
+
+  "durable_objects": {
+    "bindings": [{ "name": "INBOX_HUB", "class_name": "InboxHub" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["InboxHub"] }],
+
+  "triggers": { "crons": ["*/5 * * * *"] },
+
+  "observability": { "enabled": true }
+}

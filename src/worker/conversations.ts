@@ -1,0 +1,514 @@
+import { and, asc, desc, eq, exists, gt, isNull, lt, lte, or, type SQL, sql } from "drizzle-orm";
+import { alias } from "drizzle-orm/sqlite-core";
+import { type Context, Hono } from "hono";
+import { bodyLimit } from "hono/body-limit";
+import { createDb, type Db, schema } from "./db";
+import { CONVERSATION_STATUSES, type ConversationStatus, type SendStatus } from "./db/schema";
+import { labelsByContact } from "./labels";
+import { createNote, listNotes } from "./notes";
+import { type AppEnv, requireAuth } from "./middleware";
+import { publish } from "./realtime";
+import { applyReaction, loadReactions, publishReactions, type Reaction } from "./reactions";
+import { normalizePhone } from "../shared/phone";
+import { sendOutgoingText } from "./send";
+import { startConversation } from "./start-conversation";
+import { assignConversation, assumeConversation, type ChangeOutcome, listEvents, resolveConversation } from "./status";
+import { getUazapiClient } from "./uazapi/config";
+import { errorName } from "./errors";
+
+export const conversations = new Hono<AppEnv>();
+conversations.use("*", requireAuth);
+
+/** Teto do anexo: o arquivo passa pela memoria do Worker antes de ir ao R2. */
+const MAX_MEDIA_BYTES = 20 * 1024 * 1024;
+
+// Limite do corpo ANTES de ler: o formulario leva o arquivo (20 MB) mais margem para legenda e campos;
+// as rotas JSON so levam texto curto.
+const mediaBodyLimit = bodyLimit({
+  maxSize: MAX_MEDIA_BYTES + 1024 * 1024,
+  onError: (c) => c.json({ error: "arquivo_grande_demais", message: "Arquivo grande demais (máximo 20 MB)." }, 413),
+});
+const jsonBodyLimit = bodyLimit({
+  maxSize: 64 * 1024,
+  onError: (c) => c.json({ error: "corpo_grande_demais", message: "Conteúdo grande demais." }, 413),
+});
+
+conversations.use("*", async (c, next) => {
+  if (c.req.method === "GET" || c.req.method === "HEAD") return next();
+  const multipart = c.req.header("content-type")?.startsWith("multipart/form-data") && /\/messages$/.test(c.req.path);
+  return (multipart ? mediaBodyLimit : jsonBodyLimit)(c, next);
+});
+
+const DEFAULT_LIMIT = 50;
+const MAX_LIMIT = 100;
+const INBOX_LIMIT = 200;
+
+export type Message = Awaited<ReturnType<typeof messageView>>;
+
+export type Conversation = Awaited<ReturnType<typeof selectConversations>>[number];
+
+/** Conversa com contato e ultima mensagem, no formato da API. */
+export async function selectConversations(db: Db, where?: SQL) {
+  const lastAuthor = alias(schema.user, "last_author");
+  const rows = await db
+    .select({
+      id: schema.conversation.id,
+      status: schema.conversation.status,
+      assigneeId: schema.conversation.assigneeId,
+      assigneeName: schema.user.name,
+      unreadCount: schema.conversation.unreadCount,
+      contactId: schema.contact.id,
+      contactName: schema.contact.name,
+      contactPhone: schema.contact.phone,
+      contactAvatarUrl: schema.contact.avatarUrl,
+      msgType: schema.message.type,
+      msgText: schema.message.text,
+      msgTimestamp: schema.message.timestamp,
+      msgDirection: schema.message.direction,
+      msgStatus: schema.message.status,
+      msgAuthorId: schema.message.sentById,
+      msgAuthorName: lastAuthor.name,
+    })
+    .from(schema.conversation)
+    .innerJoin(schema.contact, eq(schema.contact.id, schema.conversation.contactId))
+    .leftJoin(schema.message, eq(schema.message.id, schema.conversation.lastMessageId))
+    .leftJoin(schema.user, eq(schema.user.id, schema.conversation.assigneeId))
+    .leftJoin(lastAuthor, eq(lastAuthor.id, schema.message.sentById))
+    .where(where)
+    .orderBy(desc(schema.conversation.lastMessageAt), desc(schema.conversation.id))
+    .limit(INBOX_LIMIT);
+  const labels = await labelsByContact(db, rows.map((r) => r.contactId));
+  return rows.map((r) => ({
+    id: r.id,
+    status: r.status,
+    assigneeId: r.assigneeId,
+    assigneeName: r.assigneeName,
+    unreadCount: r.unreadCount,
+    contact: { id: r.contactId, name: r.contactName, phone: r.contactPhone, avatarUrl: r.contactAvatarUrl, labels: labels.get(r.contactId) ?? [] },
+    lastMessage:
+      r.msgType && r.msgTimestamp != null && r.msgDirection
+        ? {
+            type: r.msgType,
+            text: r.msgText,
+            timestamp: r.msgTimestamp,
+            direction: r.msgDirection,
+            status: r.msgStatus,
+            authorId: r.msgAuthorId,
+            authorName: r.msgAuthorName,
+          }
+        : null,
+  }));
+}
+
+// Filtros da caixa: ?status=<status>&assignee=me|none|<id do membro>&label=<id da etiqueta>.
+conversations.get("/", async (c) => {
+  const status = c.req.query("status");
+  const assignee = c.req.query("assignee");
+  const label = c.req.query("label");
+  const db = createDb(c.env.DB);
+  if (status && !CONVERSATION_STATUSES.some((s) => s === status)) return c.json({ error: "status_invalido" }, 400);
+  const filters = [
+    status ? eq(schema.conversation.status, status as ConversationStatus) : undefined,
+    assignee === "none"
+      ? isNull(schema.conversation.assigneeId)
+      : assignee
+        ? eq(schema.conversation.assigneeId, assignee === "me" ? c.get("user").id : assignee)
+        : undefined,
+    label
+      ? exists(
+          db
+            .select({ one: sql`1` })
+            .from(schema.contactLabel)
+            .where(and(eq(schema.contactLabel.contactId, schema.conversation.contactId), eq(schema.contactLabel.labelId, label))),
+        )
+      : undefined,
+  ];
+  return c.json({ conversations: await selectConversations(db, and(...filters)) });
+});
+
+conversations.get("/:id", async (c) => {
+  const conversation = await loadConversation(createDb(c.env.DB), c.req.param("id"));
+  if (!conversation) return c.json({ error: "nao_encontrado" }, 404);
+  return c.json({ conversation });
+});
+
+// Cursor opaco para o cliente: "<timestamp>:<id da mensagem>" (desempate por id quando o horario empata).
+/** Uma conversa no formato da API (a mesma da lista e do detalhe), ou null se nao existe. */
+export async function loadConversation(db: Db, id: string): Promise<Conversation | null> {
+  const [conversation] = await selectConversations(db, eq(schema.conversation.id, id));
+  return conversation ?? null;
+}
+
+type Cursor = { timestamp: number; id: string };
+const encodeCursor = (m: Cursor) => `${m.timestamp}:${m.id}`;
+function decodeCursor(raw: string): Cursor | null {
+  const i = raw.indexOf(":");
+  const timestamp = Number(raw.slice(0, i));
+  if (i < 1 || !Number.isFinite(timestamp)) return null;
+  return { timestamp, id: raw.slice(i + 1) };
+}
+
+const olderThan = (cur: Cursor, inclusive = false) =>
+  or(
+    lt(schema.message.timestamp, cur.timestamp),
+    and(eq(schema.message.timestamp, cur.timestamp), (inclusive ? lte : lt)(schema.message.id, cur.id)),
+  );
+const newerThan = (cur: Cursor) =>
+  or(
+    gt(schema.message.timestamp, cur.timestamp),
+    and(eq(schema.message.timestamp, cur.timestamp), gt(schema.message.id, cur.id)),
+  );
+
+export type MessageRow = {
+  id: string;
+  direction: "in" | "out";
+  type: (typeof schema.message.$inferSelect)["type"];
+  text: string | null;
+  status: SendStatus | null;
+  authorName: string | null;
+  sentById: string | null;
+  timestamp: number;
+  mediaStatus: "pending" | "available" | "failed" | null;
+  mediaKey: string | null;
+  mediaMime: string | null;
+  mediaSize: number | null;
+  mediaName: string | null;
+  extra: string | null;
+  quotedMessageId: string | null;
+  quotedType: (typeof schema.message.$inferSelect)["type"] | null;
+  quotedText: string | null;
+  quotedDirection: "in" | "out" | null;
+  quotedAuthorName: string | null;
+};
+
+/** Mensagem no formato da API. Midia "disponivel" cujo objeto saiu do R2 (regra de 365 dias) aparece como "expired". */
+export async function messageView(bucket: R2Bucket, m: MessageRow, reactions: Reaction[]) {
+  const { mediaStatus, mediaKey, mediaMime, mediaSize, mediaName, extra, quotedMessageId, quotedType, quotedText, quotedDirection, quotedAuthorName, ...base } = m;
+  let status: "pending" | "available" | "failed" | "expired" | null = mediaStatus;
+  if (mediaStatus === "available" && (!mediaKey || !(await bucket.head(mediaKey)))) status = "expired";
+  const details = extra ? (JSON.parse(extra) as Record<string, unknown>) : null;
+  return {
+    ...base,
+    reactions,
+    media: status ? { status, mime: mediaMime, size: mediaSize, name: mediaName } : null,
+    location: m.type === "location" ? details : null,
+    contact: m.type === "contact" ? contactView(details) : null,
+    // Citacao so aparece se a mensagem original esta no historico (uma anterior a conexao do numero nao esta).
+    quote:
+      quotedMessageId && quotedType && quotedDirection
+        ? { id: quotedMessageId, type: quotedType, text: quotedText, direction: quotedDirection, authorName: quotedAuthorName }
+        : null,
+  };
+}
+
+/** Nome e primeiro telefone do vCard (linha `TEL`, ex.: `TEL;type=CELL;waid=5511...:+55 11 ...`). */
+function contactView(details: Record<string, unknown> | null) {
+  const vcard = typeof details?.vcard === "string" ? details.vcard : "";
+  const tel = /^TEL[^:\n]*:(.+)$/im.exec(vcard)?.[1]?.trim() ?? null;
+  return { name: (details?.name as string | null) ?? null, phone: tel };
+}
+
+const quoted = alias(schema.message, "quoted");
+const quotedAuthor = alias(schema.user, "quoted_author");
+
+/** Junta a mensagem citada (mesma conversa, achada pelo `messageid` do WhatsApp) e o autor dela. */
+const quoteJoinOn = and(eq(quoted.conversationId, schema.message.conversationId), eq(quoted.whatsappMessageId, schema.message.quotedId));
+
+const messageColumns = {
+  id: schema.message.id,
+  direction: schema.message.direction,
+  type: schema.message.type,
+  text: schema.message.text,
+  status: schema.message.status,
+  authorName: schema.user.name,
+  sentById: schema.message.sentById,
+  timestamp: schema.message.timestamp,
+  mediaStatus: schema.message.mediaStatus,
+  mediaKey: schema.message.mediaKey,
+  mediaMime: schema.message.mediaMime,
+  mediaSize: schema.message.mediaSize,
+  mediaName: schema.message.mediaName,
+  extra: schema.message.extra,
+  quotedMessageId: quoted.id,
+  quotedType: quoted.type,
+  quotedText: quoted.text,
+  quotedDirection: quoted.direction,
+  quotedAuthorName: quotedAuthor.name,
+};
+
+/** Ate `limit` mensagens mais antigas que o cursor, em ordem cronologica; `more` diz se ainda ha antes delas. */
+async function loadOlder(db: Db, conversationId: string, limit: number, cur?: Cursor, inclusive = false) {
+  const rows = await db
+    .select(messageColumns)
+    .from(schema.message)
+    .leftJoin(schema.user, eq(schema.user.id, schema.message.sentById))
+    .leftJoin(quoted, quoteJoinOn)
+    .leftJoin(quotedAuthor, eq(quotedAuthor.id, quoted.sentById))
+    .where(and(eq(schema.message.conversationId, conversationId), cur ? olderThan(cur, inclusive) : undefined))
+    .orderBy(desc(schema.message.timestamp), desc(schema.message.id))
+    .limit(limit + 1); // uma a mais so para saber se ha pagina mais antiga
+  return { page: rows.slice(0, limit).reverse(), more: rows.length > limit };
+}
+
+/** Ate `limit` mensagens mais novas que o cursor, em ordem cronologica. */
+async function loadNewer(db: Db, conversationId: string, limit: number, cur: Cursor) {
+  const rows = await db
+    .select(messageColumns)
+    .from(schema.message)
+    .leftJoin(schema.user, eq(schema.user.id, schema.message.sentById))
+    .leftJoin(quoted, quoteJoinOn)
+    .leftJoin(quotedAuthor, eq(quotedAuthor.id, quoted.sentById))
+    .where(and(eq(schema.message.conversationId, conversationId), newerThan(cur)))
+    .orderBy(asc(schema.message.timestamp), asc(schema.message.id))
+    .limit(limit + 1);
+  return { page: rows.slice(0, limit), more: rows.length > limit };
+}
+
+/** Uma mensagem no formato da API (a mesma do historico e do tempo real). */
+export async function loadMessage(db: Db, bucket: R2Bucket, id: string): Promise<Message | null> {
+  const [row] = await db.select(messageColumns).from(schema.message)
+    .leftJoin(schema.user, eq(schema.user.id, schema.message.sentById))
+    .leftJoin(quoted, quoteJoinOn)
+    .leftJoin(quotedAuthor, eq(quotedAuthor.id, quoted.sentById))
+    .where(eq(schema.message.id, id));
+  return row ? messageView(bucket, row, (await loadReactions(db, [row.id])).get(row.id) ?? []) : null;
+}
+
+/** Uma consulta de reacoes para a pagina inteira (nada de N+1). */
+async function views(db: Db, bucket: R2Bucket, rows: MessageRow[]) {
+  const reactions = await loadReactions(db, rows.map((m) => m.id));
+  return Promise.all(rows.map((m) => messageView(bucket, m, reactions.get(m.id) ?? [])));
+}
+
+conversations.get("/:id/messages", async (c) => {
+  const db = createDb(c.env.DB);
+  const id = c.req.param("id");
+  if (!(await conversationExists(db, id))) return c.json({ error: "nao_encontrado" }, 404);
+
+  const requested = Number.parseInt(c.req.query("limit") ?? "", 10);
+  const limit = Number.isFinite(requested) && requested > 0 ? Math.min(requested, MAX_LIMIT) : DEFAULT_LIMIT;
+
+  // around=<id da mensagem>: janela de historico centrada nela (resultado de busca).
+  const aroundId = c.req.query("around");
+  if (aroundId) {
+    const target = await db.query.message.findFirst({
+      where: and(eq(schema.message.id, aroundId), eq(schema.message.conversationId, id)),
+      columns: { id: true, timestamp: true },
+    });
+    if (!target) return c.json({ error: "nao_encontrado" }, 404);
+    const cur = { timestamp: target.timestamp, id: target.id };
+    const olderCount = Math.floor(limit / 2); // antes da mensagem; o resto vai depois dela
+    const older = await loadOlder(db, id, olderCount + 1, cur, true); // inclui a propria mensagem
+    const newer = await loadNewer(db, id, limit - olderCount - 1, cur);
+    const raw = [...older.page, ...newer.page];
+    const messages = await views(db, c.env.MEDIA, raw);
+    return c.json({
+      messages,
+      nextBefore: older.more ? encodeCursor(raw[0]!) : null,
+      nextAfter: newer.more ? encodeCursor(raw.at(-1)!) : null,
+    });
+  }
+
+  const rawAfter = c.req.query("after");
+  if (rawAfter) {
+    const after = decodeCursor(rawAfter);
+    if (!after) return c.json({ error: "cursor_invalido" }, 400);
+    const newer = await loadNewer(db, id, limit, after);
+    return c.json({ messages: await views(db, c.env.MEDIA, newer.page), nextBefore: null, nextAfter: newer.more ? encodeCursor(newer.page.at(-1)!) : null });
+  }
+
+  const rawBefore = c.req.query("before");
+  const before = rawBefore ? decodeCursor(rawBefore) : null;
+  if (rawBefore && !before) return c.json({ error: "cursor_invalido" }, 400);
+
+  const older = await loadOlder(db, id, limit, before ?? undefined);
+  return c.json({ messages: await views(db, c.env.MEDIA, older.page), nextBefore: older.more ? encodeCursor(older.page[0]!) : null });
+});
+
+// Abrir a conversa: zera o contador e marca no WhatsApp as mensagens do cliente que ainda nao tinham sido vistas.
+conversations.post("/:id/read", async (c) => {
+  const db = createDb(c.env.DB);
+  const id = c.req.param("id");
+  const conv = await db.query.conversation.findFirst({ where: eq(schema.conversation.id, id), columns: { unreadCount: true } });
+  if (!conv) return c.json({ error: "nao_encontrado" }, 404);
+  if (conv.unreadCount > 0) {
+    // As `unreadCount` mais recentes do cliente sao as nao vistas.
+    const unread = await db
+      .select({ externalId: schema.message.externalId })
+      .from(schema.message)
+      .where(and(eq(schema.message.conversationId, id), eq(schema.message.direction, "in")))
+      .orderBy(desc(schema.message.timestamp), desc(schema.message.id))
+      .limit(conv.unreadCount);
+    // Zera antes de falar com a Uazapi: falha de la nao deixa o contador preso.
+    await db.update(schema.conversation).set({ unreadCount: 0 }).where(eq(schema.conversation.id, id));
+    const ids = unread.flatMap((m) => (m.externalId ? [m.externalId] : []));
+    if (ids.length > 0) {
+      try {
+        await (await getUazapiClient(c.env)).markRead(ids);
+      } catch (err) {
+        console.error("conversa: falha ao marcar como lida na Uazapi", { erro: errorName(err) });
+      }
+    }
+    const conversation = await loadConversation(db, id);
+    if (conversation) await publish(c.env, { type: "conversation.updated", conversation });
+  }
+  return c.json({ ok: true });
+});
+
+async function conversationExists(db: Db, id: string): Promise<boolean> {
+  return !!(await db.query.conversation.findFirst({ where: eq(schema.conversation.id, id), columns: { id: true } }));
+}
+
+const MAX_TEXT_LENGTH = 4096;
+
+// Nova conversa: contato existente (`contactId`) ou numero digitado (`phone`); cria o contato se for novo.
+conversations.post("/start", async (c) => {
+  const body = await c.req.json<{ contactId?: unknown; phone?: unknown; text?: unknown }>().catch(() => null);
+  const text = typeof body?.text === "string" ? body.text : "";
+  const target =
+    typeof body?.contactId === "string" && body.contactId
+      ? { contactId: body.contactId }
+      : { phone: typeof body?.phone === "string" ? body.phone : "" };
+  if ("phone" in target && !normalizePhone(target.phone ?? "")) return c.json({ error: "numero_invalido" }, 400);
+  if (!text.trim() || text.length > MAX_TEXT_LENGTH) return c.json({ error: "texto_invalido" }, 400);
+  const result = await startConversation(c.env, { ...target, text, userId: c.get("user").id, origin: new URL(c.req.url).origin });
+  if (!result.ok) return c.json({ error: result.error }, result.error === "numero_invalido" ? 400 : 404);
+  return c.json({ conversation: result.conversation, message: result.message, created: result.created }, 201);
+});
+
+conversations.post("/:id/messages", async (c) => {
+  const base = { conversationId: c.req.param("id"), userId: c.get("user").id, origin: new URL(c.req.url).origin };
+  let input: Parameters<typeof sendOutgoingText>[1];
+  if (c.req.header("content-type")?.startsWith("multipart/form-data")) {
+    // Anexo: formulario com `file`, `text` (legenda) e `voice=1` (nota de voz gravada no navegador).
+    const form = await c.req.formData().catch(() => null);
+    const file = form?.get("file");
+    if (!(file instanceof File) || file.size === 0) return c.json({ error: "arquivo_invalido" }, 400);
+    if (file.size > MAX_MEDIA_BYTES) return c.json({ error: "arquivo_grande_demais" }, 413);
+    const voice = form?.get("voice") === "1";
+    if (voice && !file.type.startsWith("audio/")) return c.json({ error: "arquivo_invalido" }, 400);
+    const caption = form?.get("text");
+    if (typeof caption === "string" && caption.length > MAX_TEXT_LENGTH) return c.json({ error: "texto_invalido" }, 400);
+    const replyTo = form?.get("replyTo");
+    input = {
+      ...base,
+      media: { file, caption: typeof caption === "string" ? caption.trim() : "", voice },
+      replyTo: typeof replyTo === "string" && replyTo ? replyTo : undefined,
+    };
+  } else {
+    const body = await c.req.json<{ text?: unknown; replyTo?: unknown }>().catch(() => null);
+    const text = typeof body?.text === "string" ? body.text : "";
+    if (!text.trim() || text.length > MAX_TEXT_LENGTH) return c.json({ error: "texto_invalido" }, 400);
+    input = { ...base, text, replyTo: typeof body?.replyTo === "string" && body.replyTo ? body.replyTo : undefined };
+  }
+  const result = await sendOutgoingText(c.env, input);
+  if (result === "invalid_reply") return c.json({ error: "citacao_invalida" }, 400);
+  if (result === null || result === "not_failed") return c.json({ error: "nao_encontrado" }, 404);
+  return c.json({ message: result }, 201);
+});
+
+conversations.post("/:id/messages/:messageId/resend", async (c) => {
+  const result = await sendOutgoingText(c.env, {
+    conversationId: c.req.param("id"),
+    messageId: c.req.param("messageId"),
+    userId: c.get("user").id,
+    origin: new URL(c.req.url).origin,
+  });
+  if (result === null) return c.json({ error: "nao_encontrado" }, 404);
+  if (result === "not_failed") return c.json({ error: "reenvio_indisponivel" }, 409);
+  return c.json({ message: result });
+});
+
+conversations.get("/:id/events", async (c) => {
+  const db = createDb(c.env.DB);
+  const id = c.req.param("id");
+  if (!(await conversationExists(db, id))) return c.json({ error: "nao_encontrado" }, 404);
+  return c.json({ events: await listEvents(db, id) });
+});
+
+const CHANGE_ERRORS = {
+  not_found: [404, "nao_encontrado"],
+  forbidden: [403, "proibido"],
+  bad_target: [400, "responsavel_invalido"],
+  same: [409, "mesmo_responsavel"],
+  invalid_state: [409, "transicao_invalida"],
+  conflict: [409, "conversa_alterada"],
+  taken: [409, "ja_assumida"],
+  not_open: [409, "conversa_nao_aberta"],
+} as const;
+
+async function changeResponse(c: Context<AppEnv>, outcome: ChangeOutcome) {
+  if (outcome !== "ok") {
+    const [status, error] = CHANGE_ERRORS[outcome];
+    return c.json({ error }, status);
+  }
+  return c.json({ conversation: await loadConversation(createDb(c.env.DB), c.req.param("id") ?? "") });
+}
+
+conversations.post("/:id/assign", async (c) => {
+  const body = await c.req.json<{ userId?: unknown }>().catch(() => null);
+  const userId = typeof body?.userId === "string" ? body.userId : "";
+  const { id, role } = c.get("user");
+  return changeResponse(c, await assignConversation(c.env, c.req.param("id"), { id, role }, userId));
+});
+
+conversations.post("/:id/resolve", async (c) => {
+  const { id, role } = c.get("user");
+  return changeResponse(c, await resolveConversation(c.env, c.req.param("id"), { id, role }));
+});
+
+conversations.post("/:id/assume", async (c) => {
+  return changeResponse(c, await assumeConversation(c.env, c.req.param("id"), c.get("user").id));
+});
+
+conversations.get("/:id/notes", async (c) => {
+  const db = createDb(c.env.DB);
+  const id = c.req.param("id");
+  if (!(await conversationExists(db, id))) return c.json({ error: "nao_encontrado" }, 404);
+  return c.json({ notes: await listNotes(db, [id]) });
+});
+
+// Nota interna: so grava e avisa o hub. Nao e mensagem: nao passa por send.ts, nao toca a Uazapi nem muda o status.
+conversations.post("/:id/notes", async (c) => {
+  const db = createDb(c.env.DB);
+  const id = c.req.param("id");
+  if (!(await conversationExists(db, id))) return c.json({ error: "nao_encontrado" }, 404);
+  const body = await c.req.json<{ text?: unknown }>().catch(() => null);
+  const note = await createNote(db, id, c.get("user").id, body?.text);
+  if (note === "invalid") return c.json({ error: "texto_invalido" }, 400);
+  if (note === "limit") return c.json({ error: "limite_de_notas", message: "Esta conversa já tem 500 notas (o máximo)." }, 409);
+  await publish(c.env, { type: "note.created", conversationId: id, note });
+  return c.json({ note }, 201);
+});
+
+/** Reacao: janela do WhatsApp (so mensagens de ate 7 dias). */
+const REACTION_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+const MAX_EMOJI_UNITS = 16;
+// Um unico emoji: bandeira, tecla (1⃣), ou pictograma com variacao, tom de pele e/ou sequencia ZWJ.
+const SINGLE_EMOJI =
+  /^(?:\p{Regional_Indicator}{2}|[#*0-9]\uFE0F?\u20E3|\p{Extended_Pictographic}\uFE0F?\p{Emoji_Modifier}?[\u{E0020}-\u{E007F}]*(?:\u200D\p{Extended_Pictographic}\uFE0F?\p{Emoji_Modifier}?)*)$/u;
+const validEmoji = (v: unknown): v is string => typeof v === "string" && (v === "" || (v.length <= MAX_EMOJI_UNITS && SINGLE_EMOJI.test(v)));
+
+// Reagir a uma mensagem do cliente (emoji vazio remove). A Uazapi vai PRIMEIRO: se recusar, nada e gravado.
+conversations.put("/:id/messages/:messageId/reaction", async (c) => {
+  const db = createDb(c.env.DB);
+  const conversationId = c.req.param("id");
+  const body = await c.req.json<{ emoji?: unknown }>().catch(() => null);
+  const target = await db.query.message.findFirst({
+    where: and(eq(schema.message.id, c.req.param("messageId")), eq(schema.message.conversationId, conversationId)),
+    columns: { id: true, direction: true, whatsappMessageId: true, timestamp: true },
+  });
+  if (!target) return c.json({ error: "nao_encontrado" }, 404);
+  const emoji = body?.emoji;
+  if (!validEmoji(emoji)) return c.json({ error: "emoji_invalido" }, 400);
+  if (target.direction !== "in" || !target.whatsappMessageId) return c.json({ error: "reacao_indisponivel" }, 409);
+  if (Date.now() - target.timestamp > REACTION_WINDOW_MS) return c.json({ error: "reacao_expirada" }, 409);
+  try {
+    await (await getUazapiClient(c.env)).react({ id: target.whatsappMessageId, text: emoji });
+  } catch (err) {
+    console.error("conversa: falha ao reagir na Uazapi", { erro: errorName(err) });
+    return c.json({ error: "falha_ao_reagir" }, 502);
+  }
+  await applyReaction(db, { messageId: target.id, side: "team", emoji, userId: c.get("user").id, timestamp: Date.now() });
+  return c.json({ reactions: await publishReactions(c.env, db, conversationId, target.id) });
+});

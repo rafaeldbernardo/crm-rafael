@@ -1,0 +1,490 @@
+import { and, asc, desc, eq, exists, isNull, ne, sql } from "drizzle-orm";
+import { Hono } from "hono";
+import { createDb, type Db, schema } from "./db";
+import { DEAL_STATUSES, LOST_REASONS, type ConversationStatus, type DealStatus, type LostReason, type MessageType, type OriginKind } from "./db/schema";
+import { MANUAL_ORIGIN_VALUES } from "../shared/origins";
+import { type LabelView, labelsByContact } from "./labels";
+import { type AppEnv, requireAuth, requireRole } from "./middleware";
+import { publish } from "./realtime";
+
+export type StageView = { id: string; name: string };
+export type FunnelView = { id: string; name: string; stages: StageView[] };
+
+const MAX_NAME = 80;
+const MAX_LOST_NOTE = 500;
+
+function parseName(body: unknown): string | null {
+  const name = (body as { name?: unknown } | null)?.name;
+  if (typeof name !== "string" || !name.trim() || name.trim().length > MAX_NAME) return null;
+  return name.trim();
+}
+
+/** Funis com as etapas em ordem; `only` limita a um funil. */
+export async function loadFunnels(db: Db, only?: string): Promise<FunnelView[]> {
+  const funnels = await db.select().from(schema.funnel).where(only ? eq(schema.funnel.id, only) : undefined).orderBy(asc(schema.funnel.createdAt), sql`"funnel"."rowid"`);
+  const stages = await db.select().from(schema.funnelStage).orderBy(asc(schema.funnelStage.position));
+  return funnels.map((f) => ({
+    id: f.id,
+    name: f.name,
+    stages: stages.filter((s) => s.funnelId === f.id).map(({ id, name }) => ({ id, name })),
+  }));
+}
+
+/** Funil principal: o primeiro por ordem de criacao (mesma ordem da lista de funis); a entrada e a 1a etapa dele. Sem etapa, nao ha onde criar negocio. */
+export async function mainFunnelEntry(db: Db): Promise<{ funnelId: string; stageId: string } | null> {
+  const [first] = await loadFunnels(db);
+  const stage = first?.stages[0];
+  return stage ? { funnelId: first!.id, stageId: stage.id } : null;
+}
+
+export type ContactDealView = {
+  id: string;
+  funnelId: string;
+  funnelName: string;
+  stageId: string;
+  stageName: string;
+  productId: string | null;
+  productName: string | null;
+  valueCents: number | null;
+  status: DealStatus;
+  originKind: OriginKind | null;
+  originCampaignName: string | null;
+};
+
+/** Todos os negocios do contato (abertos e fechados), do mais antigo ao mais novo. */
+export async function dealsOfContact(db: Db, contactId: string): Promise<ContactDealView[]> {
+  return db
+    .select({
+      id: schema.deal.id,
+      funnelId: schema.funnel.id,
+      funnelName: schema.funnel.name,
+      stageId: schema.funnelStage.id,
+      stageName: schema.funnelStage.name,
+      productId: schema.deal.productId,
+      productName: schema.product.name,
+      valueCents: schema.deal.valueCents,
+      status: schema.deal.status,
+      originKind: schema.deal.originKind,
+      originCampaignName: schema.campaign.name,
+    })
+    .from(schema.deal)
+    .innerJoin(schema.funnel, eq(schema.funnel.id, schema.deal.funnelId))
+    .innerJoin(schema.funnelStage, eq(schema.funnelStage.id, schema.deal.stageId))
+    .leftJoin(schema.product, eq(schema.product.id, schema.deal.productId))
+    .leftJoin(schema.campaign, eq(schema.campaign.id, schema.deal.originCampaignId))
+    .where(eq(schema.deal.contactId, contactId))
+    .orderBy(asc(schema.deal.createdAt), sql`"deal"."rowid"`);
+}
+
+const changed =(env: Cloudflare.Env, funnelId: string) => publish(env, { type: "funnel.changed", funnelId });
+
+/** Funis: todo membro le; so admin cria, renomeia, apaga funis e mexe nas etapas. */
+export const funnels = new Hono<AppEnv>();
+
+funnels.get("/", requireAuth, async (c) => c.json({ funnels: await loadFunnels(createDb(c.env.DB)) }));
+
+funnels.post("/", requireAuth, requireRole("admin"), async (c) => {
+  const name = parseName(await c.req.json().catch(() => null));
+  if (!name) return c.json({ error: "funil_invalido" }, 400);
+  const row = { id: crypto.randomUUID(), name, createdAt: Date.now() };
+  await createDb(c.env.DB).insert(schema.funnel).values(row);
+  await changed(c.env, row.id);
+  return c.json({ funnel: { id: row.id, name, stages: [] } }, 201);
+});
+
+funnels.patch("/:id", requireAuth, requireRole("admin"), async (c) => {
+  const name = parseName(await c.req.json().catch(() => null));
+  if (!name) return c.json({ error: "funil_invalido" }, 400);
+  const [row] = await createDb(c.env.DB).update(schema.funnel).set({ name }).where(eq(schema.funnel.id, c.req.param("id"))).returning();
+  if (!row) return c.json({ error: "nao_encontrado" }, 404);
+  await changed(c.env, row.id);
+  return c.json({ ok: true });
+});
+
+// Etapas e negocios saem pela FK em cascata.
+funnels.delete("/:id", requireAuth, requireRole("admin"), async (c) => {
+  const gone = await createDb(c.env.DB).delete(schema.funnel).where(eq(schema.funnel.id, c.req.param("id"))).returning();
+  if (gone.length === 0) return c.json({ error: "nao_encontrado" }, 404);
+  await changed(c.env, gone[0]!.id);
+  return c.json({ ok: true });
+});
+
+funnels.post("/:id/stages", requireAuth, requireRole("admin"), async (c) => {
+  const name = parseName(await c.req.json().catch(() => null));
+  if (!name) return c.json({ error: "etapa_invalida" }, 400);
+  const db = createDb(c.env.DB);
+  const funnelId = c.req.param("id");
+  if (!(await db.query.funnel.findFirst({ where: eq(schema.funnel.id, funnelId), columns: { id: true } }))) {
+    return c.json({ error: "nao_encontrado" }, 404);
+  }
+  const existing = await db.select({ id: schema.funnelStage.id }).from(schema.funnelStage).where(eq(schema.funnelStage.funnelId, funnelId));
+  const row = { id: crypto.randomUUID(), funnelId, name, position: existing.length };
+  await db.insert(schema.funnelStage).values(row);
+  await changed(c.env, funnelId);
+  return c.json({ stage: { id: row.id, name } }, 201);
+});
+
+// Antes de `/:stageId` para nao tratar "order" como id de etapa.
+funnels.put("/:id/stages/order", requireAuth, requireRole("admin"), async (c) => {
+  const body = (await c.req.json().catch(() => null)) as { stageIds?: unknown } | null;
+  const db = createDb(c.env.DB);
+  const funnelId = c.req.param("id");
+  const [funnel] = await loadFunnels(db, funnelId);
+  if (!funnel) return c.json({ error: "nao_encontrado" }, 404);
+  const ids = body?.stageIds;
+  const known = new Set(funnel.stages.map((s) => s.id));
+  if (!Array.isArray(ids) || ids.length !== known.size || new Set(ids).size !== ids.length || !ids.every((id) => typeof id === "string" && known.has(id))) {
+    return c.json({ error: "ordem_invalida" }, 400);
+  }
+  for (const [position, id] of (ids as string[]).entries()) {
+    await db.update(schema.funnelStage).set({ position }).where(eq(schema.funnelStage.id, id));
+  }
+  await changed(c.env, funnelId);
+  return c.json({ ok: true });
+});
+
+funnels.patch("/:id/stages/:stageId", requireAuth, requireRole("admin"), async (c) => {
+  const name = parseName(await c.req.json().catch(() => null));
+  if (!name) return c.json({ error: "etapa_invalida" }, 400);
+  const { id, stageId } = c.req.param();
+  const [row] = await createDb(c.env.DB)
+    .update(schema.funnelStage)
+    .set({ name })
+    .where(and(eq(schema.funnelStage.id, stageId), eq(schema.funnelStage.funnelId, id)))
+    .returning();
+  if (!row) return c.json({ error: "nao_encontrado" }, 404);
+  await changed(c.env, id);
+  return c.json({ ok: true });
+});
+
+/** Ids dos negocios da etapa, na ordem do quadro. */
+async function stageDeals(db: Db, stageId: string): Promise<string[]> {
+  const rows = await db
+    .select({ id: schema.deal.id })
+    .from(schema.deal)
+    .where(eq(schema.deal.stageId, stageId))
+    .orderBy(asc(schema.deal.position), sql`"deal"."rowid"`);
+  return rows.map((r) => r.id);
+}
+
+/** Grava a ordem dos negocios da etapa (posicao = indice na lista). */
+async function setOrder(db: Db, stageId: string, dealIds: string[]) {
+  for (const [position, id] of dealIds.entries()) {
+    await db.update(schema.deal).set({ stageId, position }).where(eq(schema.deal.id, id));
+  }
+}
+
+const stageOf = (db: Db, funnelId: string, stageId: string) =>
+  db.query.funnelStage.findFirst({ where: and(eq(schema.funnelStage.id, stageId), eq(schema.funnelStage.funnelId, funnelId)) });
+
+// Apagar etapa com negocios exige `moveTo` (outra etapa do mesmo funil); os negocios vao para o fim dela, na mesma ordem.
+funnels.delete("/:id/stages/:stageId", requireAuth, requireRole("admin"), async (c) => {
+  const db = createDb(c.env.DB);
+  const { id, stageId } = c.req.param();
+  if (!(await stageOf(db, id, stageId))) return c.json({ error: "nao_encontrado" }, 404);
+  const moving = await stageDeals(db, stageId);
+  if (moving.length > 0) {
+    const body = (await c.req.json().catch(() => null)) as { moveTo?: unknown } | null;
+    if (body?.moveTo === undefined) return c.json({ error: "etapa_com_negocios" }, 409);
+    if (typeof body.moveTo !== "string" || body.moveTo === stageId || !(await stageOf(db, id, body.moveTo))) {
+      return c.json({ error: "destino_invalido" }, 400);
+    }
+    await setOrder(db, body.moveTo, [...(await stageDeals(db, body.moveTo)), ...moving]);
+  }
+  await db.delete(schema.funnelStage).where(eq(schema.funnelStage.id, stageId));
+  const [funnel] = await loadFunnels(db, id);
+  for (const [position, s] of funnel!.stages.entries()) {
+    await db.update(schema.funnelStage).set({ position }).where(eq(schema.funnelStage.id, s.id));
+  }
+  await changed(c.env, id);
+  return c.json({ ok: true });
+});
+
+export type CardView = {
+  dealId: string;
+  dealStatus: DealStatus;
+  lostReason: LostReason | null;
+  lostNote: string | null;
+  closedAt: number | null;
+  closedById: string | null;
+  productId: string | null;
+  productName: string | null;
+  valueCents: number | null;
+  originKind: OriginKind | null;
+  originCampaignId: string | null;
+  originCampaignName: string | null;
+  contactId: string;
+  name: string | null;
+  phone: string | null;
+  conversationId: string | null;
+  assigneeId: string | null;
+  assigneeName: string | null;
+  status: ConversationStatus | null;
+  avatarUrl: string | null;
+  lastMessage: { type: MessageType; text: string | null; timestamp: number } | null;
+  labels: LabelView[];
+};
+
+// Quadro: ?status=aberto(padrao)|ganho|perdido &label=<id> &assignee=me|none|<id> (responsavel da conversa do contato) &product=none|<id>.
+funnels.get("/:id/board", requireAuth, async (c) => {
+  const db = createDb(c.env.DB);
+  const id = c.req.param("id");
+  const [funnel] = await loadFunnels(db, id);
+  if (!funnel) return c.json({ error: "nao_encontrado" }, 404);
+  const label = c.req.query("label");
+  const assignee = c.req.query("assignee");
+  const product = c.req.query("product");
+  const status = DEAL_STATUSES.find((s) => s === c.req.query("status")) ?? "aberto";
+  const rows = await db
+    .select({
+      stageId: schema.deal.stageId,
+      dealId: schema.deal.id,
+      dealStatus: schema.deal.status,
+      lostReason: schema.deal.lostReason,
+      lostNote: schema.deal.lostNote,
+      closedAt: schema.deal.closedAt,
+      closedById: schema.deal.closedById,
+      productId: schema.deal.productId,
+      productName: schema.product.name,
+      valueCents: schema.deal.valueCents,
+      originKind: schema.deal.originKind,
+      originCampaignId: schema.deal.originCampaignId,
+      originCampaignName: schema.campaign.name,
+      contactId: schema.contact.id,
+      name: schema.contact.name,
+      phone: schema.contact.phone,
+      conversationId: schema.conversation.id,
+      assigneeId: schema.conversation.assigneeId,
+      assigneeName: schema.user.name,
+      status: schema.conversation.status,
+      avatarUrl: schema.contact.avatarUrl,
+      msgType: schema.message.type,
+      msgText: schema.message.text,
+      msgTimestamp: schema.message.timestamp,
+    })
+    .from(schema.deal)
+    .innerJoin(schema.contact, eq(schema.contact.id, schema.deal.contactId))
+    .leftJoin(schema.product, eq(schema.product.id, schema.deal.productId))
+    .leftJoin(schema.campaign, eq(schema.campaign.id, schema.deal.originCampaignId))
+    .leftJoin(schema.conversation, eq(schema.conversation.contactId, schema.contact.id))
+    .leftJoin(schema.message, eq(schema.message.id, schema.conversation.lastMessageId))
+    .leftJoin(schema.user, eq(schema.user.id, schema.conversation.assigneeId))
+    .where(
+      and(
+        eq(schema.deal.funnelId, id),
+        eq(schema.deal.status, status),
+        product === "none" ? isNull(schema.deal.productId) : product ? eq(schema.deal.productId, product) : undefined,
+        assignee === "none"
+          ? isNull(schema.conversation.assigneeId)
+          : assignee
+            ? eq(schema.conversation.assigneeId, assignee === "me" ? c.get("user").id : assignee)
+            : undefined,
+        label
+          ? exists(
+              db
+                .select({ one: sql`1` })
+                .from(schema.contactLabel)
+                .where(and(eq(schema.contactLabel.contactId, schema.contact.id), eq(schema.contactLabel.labelId, label))),
+            )
+          : undefined,
+      ),
+    )
+    .orderBy(...(status === "aberto" ? [asc(schema.deal.position), sql`"deal"."rowid"`] : [desc(schema.deal.closedAt), sql`"deal"."rowid" desc`]));
+  const labels = await labelsByContact(db, rows.map((r) => r.contactId));
+  return c.json({
+    funnel,
+    stages: funnel.stages.map((s) => ({
+      ...s,
+      cards: rows
+        .filter((r) => r.stageId === s.id)
+        .map(
+          ({ stageId: _stage, msgType, msgText, msgTimestamp, ...r }): CardView => ({
+            ...r,
+            lastMessage: msgType && msgTimestamp != null ? { type: msgType, text: msgText, timestamp: msgTimestamp } : null,
+            labels: labels.get(r.contactId) ?? [],
+          }),
+        ),
+    })),
+  });
+});
+
+type DealFields = { productId?: string | null; valueCents?: number | null; originKind?: OriginKind | null; originCampaignId?: string | null };
+
+/** Campos editaveis do negocio; `null` se algum for invalido. So vem o que o corpo trouxe. */
+function parseDealFields(body: Record<string, unknown>): DealFields | null {
+  const out: DealFields = {};
+  if ("productId" in body) {
+    if (body.productId !== null && typeof body.productId !== "string") return null;
+    out.productId = body.productId;
+  }
+  if ("valueCents" in body) {
+    const v = body.valueCents;
+    if (v !== null && (typeof v !== "number" || !Number.isSafeInteger(v) || v < 0)) return null;
+    out.valueCents = v;
+  }
+  const campaignId = body.originCampaignId;
+  if (campaignId !== undefined && campaignId !== null && typeof campaignId !== "string") return null;
+  if ("originKind" in body) {
+    const o = body.originKind;
+    if (o !== null && o !== "campanha" && !(MANUAL_ORIGIN_VALUES as readonly unknown[]).includes(o)) return null;
+    // Campanha pede o id; qualquer outra origem (ou nenhuma) nao pode trazer id e solta o vinculo antigo.
+    if (o === "campanha" ? !campaignId : Boolean(campaignId)) return null;
+    out.originKind = o as OriginKind | null;
+    out.originCampaignId = o === "campanha" ? (campaignId as string) : null;
+  } else if (campaignId) return null;
+  return out;
+}
+
+/** Campanha de origem precisa existir e estar ativa (ou ser a que o negocio ja tem, mesmo arquivada). */
+async function campaignAllowed(db: Db, campaignId: string | null | undefined, current: string | null = null): Promise<boolean> {
+  if (!campaignId || campaignId === current) return true;
+  const found = await db.query.campaign.findFirst({ where: eq(schema.campaign.id, campaignId), columns: { archivedAt: true } });
+  return Boolean(found) && found!.archivedAt === null;
+}
+
+/** Produto ativo (ou o que o negocio ja tem, mesmo arquivado). */
+const findProduct = (db: Db, productId: string) => db.query.product.findFirst({ where: eq(schema.product.id, productId) });
+
+funnels.post("/:id/deals", requireAuth, async (c) => {
+  const body = (await c.req.json().catch(() => null)) as Record<string, unknown> | null;
+  if (!body || typeof body.contactId !== "string" || typeof body.stageId !== "string") return c.json({ error: "negocio_invalido" }, 400);
+  const fields = parseDealFields(body);
+  if (!fields) return c.json({ error: "negocio_invalido" }, 400);
+  const db = createDb(c.env.DB);
+  const id = c.req.param("id");
+  if (!(await campaignAllowed(db, fields.originCampaignId))) return c.json({ error: "negocio_invalido" }, 400);
+  const [stage, contact] = await Promise.all([
+    stageOf(db, id, body.stageId),
+    db.query.contact.findFirst({ where: eq(schema.contact.id, body.contactId), columns: { id: true } }),
+  ]);
+  if (!stage || !contact) return c.json({ error: "nao_encontrado" }, 404);
+  let valueCents = fields.valueCents;
+  if (fields.productId) {
+    const product = await findProduct(db, fields.productId);
+    if (!product || product.archivedAt !== null) return c.json({ error: "nao_encontrado" }, 404);
+    if (valueCents === undefined) valueCents = product.priceCents;
+  }
+  const row = {
+    id: crypto.randomUUID(),
+    contactId: contact.id,
+    funnelId: id,
+    stageId: stage.id,
+    position: (await stageDeals(db, stage.id)).length,
+    productId: fields.productId ?? null,
+    valueCents: valueCents ?? null,
+    originKind: fields.originKind ?? null,
+    originCampaignId: fields.originCampaignId ?? null,
+    createdAt: Date.now(),
+  };
+  await db.insert(schema.deal).values(row);
+  await changed(c.env, id);
+  return c.json({ deal: { id: row.id } }, 201);
+});
+
+// Editar produto, valor e origem. Trocar o produto nao mexe no valor (o front sugere o preco, o atendente decide).
+funnels.patch("/:id/deals/:dealId", requireAuth, async (c) => {
+  const body = (await c.req.json().catch(() => null)) as Record<string, unknown> | null;
+  const fields = body && typeof body === "object" ? parseDealFields(body) : null;
+  if (!fields || Object.keys(fields).length === 0) return c.json({ error: "negocio_invalido" }, 400);
+  const db = createDb(c.env.DB);
+  const { id, dealId } = c.req.param();
+  const deal = await db.query.deal.findFirst({ where: and(eq(schema.deal.id, dealId), eq(schema.deal.funnelId, id)) });
+  if (!deal) return c.json({ error: "nao_encontrado" }, 404);
+  if (deal.status !== "aberto") return c.json({ error: "negocio_fechado" }, 409);
+  if (!(await campaignAllowed(db, fields.originCampaignId, deal.originCampaignId))) return c.json({ error: "negocio_invalido" }, 400);
+  if (fields.productId && fields.productId !== deal.productId) {
+    const product = await findProduct(db, fields.productId);
+    if (!product || product.archivedAt !== null) return c.json({ error: "nao_encontrado" }, 404);
+  }
+  await db.update(schema.deal).set(fields).where(eq(schema.deal.id, dealId));
+  await changed(c.env, id);
+  return c.json({ ok: true });
+});
+
+// Arrastar: `stageId` de destino e `index` (posicao dentro da etapa; sem ele, vai para o fim).
+funnels.put("/:id/deals/:dealId", requireAuth, async (c) => {
+  const body = (await c.req.json().catch(() => null)) as { stageId?: unknown; index?: unknown } | null;
+  if (typeof body?.stageId !== "string" || (body.index !== undefined && !Number.isInteger(body.index))) {
+    return c.json({ error: "negocio_invalido" }, 400);
+  }
+  const db = createDb(c.env.DB);
+  const { id, dealId } = c.req.param();
+  const [stage, deal] = await Promise.all([
+    stageOf(db, id, body.stageId),
+    db.query.deal.findFirst({ where: and(eq(schema.deal.id, dealId), eq(schema.deal.funnelId, id)), columns: { id: true, status: true } }),
+  ]);
+  if (!stage || !deal) return c.json({ error: "nao_encontrado" }, 404);
+  if (deal.status !== "aberto") return c.json({ error: "negocio_fechado" }, 409);
+  const others = (await stageDeals(db, stage.id)).filter((d) => d !== dealId);
+  const at = Math.min(Math.max(typeof body.index === "number" ? body.index : others.length, 0), others.length);
+  others.splice(at, 0, dealId);
+  await setOrder(db, stage.id, others);
+  await changed(c.env, id);
+  return c.json({ ok: true });
+});
+
+// Negocio fechado e somente leitura: a condicao `aberto` no DELETE segura a corrida com um fechamento.
+funnels.delete("/:id/deals/:dealId", requireAuth, async (c) => {
+  const db = createDb(c.env.DB);
+  const { id, dealId } = c.req.param();
+  const deal = await db.query.deal.findFirst({ where: and(eq(schema.deal.id, dealId), eq(schema.deal.funnelId, id)), columns: { status: true } });
+  if (!deal) return c.json({ error: "nao_encontrado" }, 404);
+  const gone = await db
+    .delete(schema.deal)
+    .where(and(eq(schema.deal.id, dealId), eq(schema.deal.funnelId, id), eq(schema.deal.status, "aberto")))
+    .returning({ id: schema.deal.id });
+  if (gone.length === 0) return c.json({ error: "negocio_fechado" }, 409);
+  await changed(c.env, id);
+  return c.json({ ok: true });
+});
+
+// Fechar: Ganhou exige o valor confirmado (inteiro > 0); Perdeu exige o motivo da lista fixa, com observacao opcional.
+funnels.post("/:id/deals/:dealId/close", requireAuth, async (c) => {
+  const body = (await c.req.json().catch(() => null)) as Record<string, unknown> | null;
+  if (!body || typeof body !== "object") return c.json({ error: "fechamento_invalido" }, 400);
+  let set: Partial<typeof schema.deal.$inferInsert>;
+  if (body.status === "ganho") {
+    const v = body.valueCents;
+    if (typeof v !== "number" || !Number.isSafeInteger(v) || v <= 0) return c.json({ error: "fechamento_invalido" }, 400);
+    set = { status: "ganho", valueCents: v };
+  } else if (body.status === "perdido") {
+    const reason = LOST_REASONS.find((r) => r === body.lostReason);
+    const note = body.lostNote;
+    if (!reason || (note !== undefined && note !== null && (typeof note !== "string" || note.length > MAX_LOST_NOTE))) {
+      return c.json({ error: "fechamento_invalido" }, 400);
+    }
+    set = { status: "perdido", lostReason: reason, lostNote: typeof note === "string" && note.trim() ? note.trim() : null };
+  } else {
+    return c.json({ error: "fechamento_invalido" }, 400);
+  }
+  const db = createDb(c.env.DB);
+  const { id, dealId } = c.req.param();
+  const deal = await db.query.deal.findFirst({ where: and(eq(schema.deal.id, dealId), eq(schema.deal.funnelId, id)) });
+  if (!deal) return c.json({ error: "nao_encontrado" }, 404);
+  // A condicao `aberto` no UPDATE segura a corrida de dois fechamentos ao mesmo tempo.
+  const done = await db
+    .update(schema.deal)
+    .set({ ...set, closedAt: Date.now(), closedById: c.get("user").id })
+    .where(and(eq(schema.deal.id, dealId), eq(schema.deal.status, "aberto")))
+    .returning({ id: schema.deal.id });
+  if (done.length === 0) return c.json({ error: "negocio_ja_fechado" }, 409);
+  await changed(c.env, id);
+  return c.json({ ok: true });
+});
+
+// Reabrir: so admin (o papel e relido no D1 por `requireRole`). Volta a `aberto` no fim da mesma etapa.
+funnels.post("/:id/deals/:dealId/reopen", requireAuth, requireRole("admin"), async (c) => {
+  const db = createDb(c.env.DB);
+  const { id, dealId } = c.req.param();
+  const deal = await db.query.deal.findFirst({ where: and(eq(schema.deal.id, dealId), eq(schema.deal.funnelId, id)) });
+  if (!deal) return c.json({ error: "nao_encontrado" }, 404);
+  const done = await db
+    .update(schema.deal)
+    .set({ status: "aberto", lostReason: null, lostNote: null, closedAt: null, closedById: null })
+    .where(and(eq(schema.deal.id, dealId), ne(schema.deal.status, "aberto")))
+    .returning({ id: schema.deal.id });
+  if (done.length === 0) return c.json({ error: "negocio_aberto" }, 409);
+  await setOrder(db, deal.stageId, [...(await stageDeals(db, deal.stageId)).filter((d) => d !== dealId), dealId]);
+  await changed(c.env, id);
+  return c.json({ ok: true });
+});

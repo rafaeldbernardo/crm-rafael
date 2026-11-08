@@ -1,0 +1,181 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "6",
+      "when": 1793146160811,
+      "tag": "0000_init",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1793149048921,
+      "tag": "0001_fat_whiplash",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1793151961783,
+      "tag": "0002_busca_fts",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1793152384904,
+      "tag": "0003_true_the_call",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1793152518687,
+      "tag": "0004_tiresome_the_leader",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1793152656779,
+      "tag": "0005_simple_gravity",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1793152876956,
+      "tag": "0006_marvelous_centennial",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "6",
+      "when": 1793153016966,
+      "tag": "0007_famous_fenris",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "6",
+      "when": 1793153146355,
+      "tag": "0008_cloudy_cassandra_nova",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "6",
+      "when": 1793153265627,
+      "tag": "0009_conscious_rawhide_kid",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "6",
+      "when": 1793153450966,
+      "tag": "0010_rainy_war_machine",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "6",
+      "when": 1793153947370,
+      "tag": "0011_curvy_miracleman",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "6",
+      "when": 1793154624483,
+      "tag": "0012_equal_hellfire_club",
+      "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "6",
+      "when": 1793154906635,
+      "tag": "0013_foamy_cardiac",
+      "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "6",
+      "when": 1793155578227,
+      "tag": "0014_certain_rhino",
+      "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "6",
+      "when": 1793192120776,
+      "tag": "0015_sticky_magdalene",
+      "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "6",
+      "when": 1793214185529,
+      "tag": "0016_minor_quentin_quire",
+      "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "6",
+      "when": 1793215664250,
+      "tag": "0017_sudden_king_cobra",
+      "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "6",
+      "when": 1793218044090,
+      "tag": "0018_rate_limit",
+      "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "6",
+      "when": 1793228794542,
+      "tag": "0019_steep_payback",
+      "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "6",
+      "when": 1793968583733,
+      "tag": "0020_produtos",
+      "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "6",
+      "when": 1793969011056,
+      "tag": "0021_negocios",
+      "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "6",
+      "when": 1793970433088,
+      "tag": "0022_campanhas",
+      "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "6",
+      "when": 1793971164851,
+      "tag": "0023_campanha_automatica",
+      "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "6",
+      "when": 1793988146792,
+      "tag": "0024_reacoes",
+      "breakpoints": true
+    }
+  ]
+}

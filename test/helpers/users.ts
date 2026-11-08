@@ -1,0 +1,19 @@
+import { env } from "cloudflare:workers";
+import { buildUserStatements, type NewUser } from "../../src/worker/db/seed-user";
+
+/** Cria usuario no D1 do teste com a MESMA funcao que o script de bootstrap usa (hash + user + account). */
+export async function createUser(input: Partial<NewUser> & Pick<NewUser, "email" | "password">): Promise<string> {
+  const { userId, statements } = await buildUserStatements({ name: "Pessoa de Teste", role: "atendente", ...input });
+  await env.DB.batch(statements.map((s) => env.DB.prepare(s.sql).bind(...s.params)));
+  return userId;
+}
+
+/** Remove o usuario do D1 (arrange de teste): as conversas dele ficam sem responsavel pela FK. */
+export async function deleteUser(userId: string): Promise<void> {
+  await env.DB.prepare("DELETE FROM user WHERE id = ?").bind(userId).run();
+}
+
+/** Muda o papel de um usuario ja criado (arrange de teste, direto no D1). */
+export async function setUserRole(userId: string, role: NewUser["role"]): Promise<void> {
+  await env.DB.prepare("UPDATE user SET role = ? WHERE id = ?").bind(role, userId).run();
+}

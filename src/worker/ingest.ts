@@ -1,0 +1,280 @@
+import { and, eq, isNull, lte, or, sql } from "drizzle-orm";
+import type { Db } from "./db";
+import { schema } from "./db";
+import { applyCampaignCode, type CampaignHit } from "./campaign-deal";
+import { errorName } from "./errors";
+import { applyReaction } from "./reactions";
+import { reopenOnClientMessage } from "./status";
+
+/** Campos do evento `messages` da Uazapi que usamos. */
+export interface UazapiMessage {
+  id?: string;
+  messageid?: string;
+  chatid?: string;
+  sender?: string;
+  sender_pn?: string;
+  sender_lid?: string;
+  senderName?: string;
+  fromMe?: boolean;
+  isGroup?: boolean;
+  messageType?: string;
+  text?: string;
+  messageTimestamp?: number;
+  /** "image", "video", "audio", "ptt", "document", "sticker" (nao validado com webhook real). */
+  mediaType?: string;
+  /** Detalhes da midia/localizacao/contato; texto simples traz string. */
+  content?: unknown;
+  /** Resposta com citacao: id da mensagem citada, com ou sem o prefixo `owner:` (nao validado com webhook real). */
+  quoted?: string;
+  /** Reacao: `messageid` do WhatsApp da mensagem alvo, com ou sem o prefixo `owner:` (nao validado com webhook real). */
+  reaction?: string;
+}
+
+type MessageType = (typeof schema.message.$inferInsert)["type"];
+
+interface Parsed {
+  type: MessageType;
+  text: string | null;
+  media: { mime: string | null; size: number | null; name: string | null } | null;
+  extra: unknown;
+}
+
+const MEDIA_KINDS: Record<string, MessageType> = {
+  image: "image",
+  video: "video",
+  audio: "audio",
+  ptt: "voice",
+  document: "document",
+  sticker: "sticker",
+};
+
+const str = (v: unknown): string | null => (typeof v === "string" && v ? v : null);
+const num = (v: unknown): number | null => (v !== "" && v != null && Number.isFinite(Number(v)) ? Number(v) : null);
+
+/**
+ * Decide tipo, texto e detalhes. O formato da midia ainda nao foi confirmado com webhook real:
+ * le `mediaType` e, sem ele, o `messageType` ("ImageMessage" etc.), sem diferenciar caixa, e tolera campos ausentes.
+ */
+function parse(msg: UazapiMessage, text: string | null): Parsed {
+  const content = msg.content && typeof msg.content === "object" ? (msg.content as Record<string, unknown>) : {};
+  const mt = msg.messageType?.toLowerCase() ?? "";
+  if (!msg.messageType ? !!msg.text : TEXT_TYPES.includes(mt)) return { type: "text", text: msg.text ?? null, media: null, extra: null };
+
+  const kind = msg.mediaType?.toLowerCase() ?? (/^(image|video|audio|document|sticker)message$/.exec(mt)?.[1] ?? null);
+  const type = kind ? MEDIA_KINDS[kind] : undefined;
+  if (type) {
+    // Nota de voz as vezes vem como audio com PTT=true.
+    const voice = type === "audio" && content.PTT === true;
+    return {
+      type: voice ? "voice" : type,
+      text: text ?? str(content.caption),
+      media: { mime: str(content.mimetype), size: num(content.fileLength), name: str(content.fileName) ?? str(content.title) },
+      extra: null,
+    };
+  }
+  if (mt === "locationmessage" || mt === "livelocationmessage") {
+    const lat = num(content.degreesLatitude);
+    const lng = num(content.degreesLongitude);
+    if (lat !== null && lng !== null)
+      return { type: "location", text: null, media: null, extra: { lat, lng, name: str(content.name), address: str(content.address) } };
+  }
+  if (mt === "contactmessage") {
+    return { type: "contact", text: null, media: null, extra: { name: str(content.displayName), vcard: str(content.vcard) } };
+  }
+  return { type: "unsupported", text: null, media: null, extra: null };
+}
+
+/** `messageid` do WhatsApp da mensagem citada: do campo `quoted` ou, sem ele, de `content.contextInfo.stanzaID`. */
+function quotedId(msg: UazapiMessage): string | null {
+  const content = msg.content && typeof msg.content === "object" ? (msg.content as Record<string, unknown>) : {};
+  const info = content.contextInfo && typeof content.contextInfo === "object" ? (content.contextInfo as Record<string, unknown>) : {};
+  const raw = str(msg.quoted) ?? str(info.stanzaID);
+  return raw ? raw.slice(raw.lastIndexOf(":") + 1) || null : null;
+}
+
+const TEXT_TYPES = ["conversation", "extendedtextmessage"];
+const PN_SUFFIX = "@s.whatsapp.net";
+const LID_SUFFIX = "@lid";
+
+/** JIDs conhecidos do remetente: numero (so digitos + JID completo) e/ou LID. */
+function identities(msg: UazapiMessage) {
+  const jids = [msg.sender_pn, msg.sender_lid, msg.sender, msg.chatid].filter((j): j is string => !!j);
+  const jidPn = jids.find((j) => j.endsWith(PN_SUFFIX)) ?? null;
+  const jidLid = jids.find((j) => j.endsWith(LID_SUFFIX)) ?? null;
+  return { jidPn, jidLid, phone: jidPn ? jidPn.slice(0, -PN_SUFFIX.length) : null };
+}
+
+/** Acha o contato pelo numero ou pelo LID (o numero tem prioridade) e completa o que ainda faltava; senao cria. */
+async function resolveContact(db: Db, msg: UazapiMessage, now: number): Promise<string> {
+  const { jidPn, jidLid, phone } = identities(msg);
+  const byPhone = phone ? await db.query.contact.findFirst({ where: eq(schema.contact.phone, phone) }) : undefined;
+  const byLid = jidLid ? await db.query.contact.findFirst({ where: eq(schema.contact.jidLid, jidLid) }) : undefined;
+  const found = byPhone ?? byLid;
+  if (found) {
+    const patch: Partial<typeof schema.contact.$inferInsert> = {};
+    if (!found.phone && phone) patch.phone = phone;
+    if (!found.jidPn && jidPn) patch.jidPn = jidPn;
+    // Se o LID ja pertence a outro contato, nao o move (evita violar a unicidade).
+    if (!found.jidLid && jidLid && !byLid) patch.jidLid = jidLid;
+    if (!found.name && msg.senderName) patch.name = msg.senderName;
+    if (Object.keys(patch).length > 0) await db.update(schema.contact).set(patch).where(eq(schema.contact.id, found.id));
+    return found.id;
+  }
+  const id = crypto.randomUUID();
+  await db.insert(schema.contact).values({ id, name: msg.senderName || null, phone, jidPn, jidLid, createdAt: now });
+  return id;
+}
+
+async function resolveConversation(db: Db, contactId: string, now: number): Promise<string> {
+  await db
+    .insert(schema.conversation)
+    .values({ id: crypto.randomUUID(), contactId, createdAt: now })
+    .onConflictDoNothing({ target: schema.conversation.contactId });
+  const conv = await db.query.conversation.findFirst({ where: eq(schema.conversation.contactId, contactId) });
+  return conv!.id;
+}
+
+/** Reacao gravada (ou removida): nao e mensagem, so o chamador avisa o tempo real. */
+export type ReactionIngest = { reactedMessageId: string; conversationId: string };
+
+/** Reacao no evento `messages`: tolera `messageType` reaction/reactionmessage ou o campo `reaction`; o alvo vem de `reaction` ou `content.key.ID`. */
+function reactionOf(msg: UazapiMessage): { target: string | null; emoji: string } | null {
+  const mt = msg.messageType?.toLowerCase();
+  if (mt !== "reactionmessage" && mt !== "reaction" && !str(msg.reaction)) return null;
+  const content = msg.content && typeof msg.content === "object" ? (msg.content as Record<string, unknown>) : {};
+  const key = content.key && typeof content.key === "object" ? (content.key as Record<string, unknown>) : {};
+  const raw = str(msg.reaction) ?? str(key.ID) ?? str(key.id);
+  return { target: raw ? raw.slice(raw.lastIndexOf(":") + 1) || null : null, emoji: str(msg.text) ?? str(content.text) ?? "" };
+}
+
+/** Grava a reacao na mensagem alvo (achada pelo `messageid` do WhatsApp). Alvo fora do banco: ignora (null). */
+async function ingestReaction(db: Db, msg: UazapiMessage, reaction: { target: string | null; emoji: string }): Promise<ReactionIngest | null> {
+  if (!reaction.target) return null;
+  const target = await db.query.message.findFirst({
+    where: eq(schema.message.whatsappMessageId, reaction.target),
+    columns: { id: true, conversationId: true },
+  });
+  if (!target) return null;
+  // `fromMe` com o mesmo emoji ja gravado: e o eco da reacao que o CRM mandou (mantem o atendente, nao publica).
+  if (msg.fromMe && reaction.emoji) {
+    const atual = await db.query.messageReaction.findFirst({
+      where: and(eq(schema.messageReaction.messageId, target.id), eq(schema.messageReaction.side, "team")),
+      columns: { emoji: true },
+    });
+    if (atual?.emoji === reaction.emoji) return null;
+  }
+  // `fromMe`: alguem da empresa reagiu pelo celular (sem atendente).
+  await applyReaction(db, {
+    messageId: target.id,
+    side: msg.fromMe ? "team" : "contact",
+    emoji: reaction.emoji,
+    userId: null,
+    timestamp: msg.messageTimestamp ?? Date.now(),
+  });
+  return { reactedMessageId: target.id, conversationId: target.conversationId };
+}
+
+export type IngestResult = {
+  conversationId: string;
+  messageId: string;
+  reopened: { eventId: string | null } | undefined;
+  campaign: CampaignHit | null;
+  /** Mensagem que ja estava gravada: so o codigo de campanha foi reaplicado (o chamador nao republica a mensagem). */
+  alreadyStored?: true;
+};
+
+/** Aplica o codigo de campanha da mensagem. Falha aqui nunca desfaz a mensagem ja gravada: o reprocessamento tenta de novo. */
+async function tryCampaignCode(db: Db, input: Parameters<typeof applyCampaignCode>[1]): Promise<CampaignHit | null> {
+  try {
+    return await applyCampaignCode(db, input);
+  } catch (err) {
+    console.error("ingest: falha ao aplicar codigo de campanha", { erro: errorName(err) });
+    return null;
+  }
+}
+
+/**
+ * Processa o evento `messages`. Descarta grupo e `fromMe` (exceto reacao, que nao e mensagem); idempotente por `message.id`.
+ * Lanca se o payload nao tem `message.id` (o evento fica sem `processedAt`).
+ */
+export async function ingestMessage(
+  db: Db,
+  msg: UazapiMessage,
+  queue: Queue<MediaJob>,
+): Promise<IngestResult | ReactionIngest | null> {
+  if (msg.isGroup) return null;
+  const reaction = reactionOf(msg);
+  if (reaction) return ingestReaction(db, msg, reaction);
+  if (msg.fromMe) return null;
+  if (!msg.id) throw new Error("mensagem sem id");
+
+  const already = await db.query.message.findFirst({ where: eq(schema.message.externalId, msg.id) });
+  if (already) {
+    // Reenvio do webhook ou reconciliacao: se o codigo de campanha falhou da 1a vez, tenta de novo com o id da mensagem GRAVADA
+    // (idempotente por `deal.sourceMessageId` e pelo indice unico do evento).
+    const conversation = await db.query.conversation.findFirst({ where: eq(schema.conversation.id, already.conversationId) });
+    if (!conversation) return null;
+    const campaign = await tryCampaignCode(db, {
+      contactId: conversation.contactId,
+      conversationId: conversation.id,
+      messageId: already.id,
+      text: already.text,
+      timestamp: already.timestamp,
+    });
+    return campaign ? { conversationId: conversation.id, messageId: already.id, reopened: undefined, campaign, alreadyStored: true } : null;
+  }
+
+  const now = Date.now();
+  const contactId = await resolveContact(db, msg, now);
+  const conversationId = await resolveConversation(db, contactId, now);
+
+  const parsed = parse(msg, msg.text || null);
+  const timestamp = msg.messageTimestamp ?? now;
+  const inserted = await db
+    .insert(schema.message)
+    .values({
+      id: crypto.randomUUID(),
+      externalId: msg.id,
+      whatsappMessageId: msg.messageid ?? null,
+      conversationId,
+      direction: "in",
+      type: parsed.type,
+      text: parsed.text,
+      timestamp,
+      mediaStatus: parsed.media ? "pending" : null,
+      mediaMime: parsed.media?.mime ?? null,
+      mediaSize: parsed.media?.size ?? null,
+      mediaName: parsed.media?.name ?? null,
+      extra: parsed.extra ? JSON.stringify(parsed.extra) : null,
+      quotedId: quotedId(msg),
+    })
+    .onConflictDoNothing({ target: schema.message.externalId })
+    .returning({ id: schema.message.id });
+  if (inserted.length === 0) return null; // corrida com outro request: ja ingerida
+  const messageId = inserted[0]!.id;
+
+  await db
+    .update(schema.conversation)
+    .set({ unreadCount: sql`${schema.conversation.unreadCount} + 1` })
+    .where(eq(schema.conversation.id, conversationId));
+  // So avanca o "ultimo" se esta for a mais recente (evento atrasado nao volta a previa).
+  await db
+    .update(schema.conversation)
+    .set({ lastMessageAt: timestamp, lastMessageId: messageId })
+    .where(
+      and(
+        eq(schema.conversation.id, conversationId),
+        or(isNull(schema.conversation.lastMessageAt), lte(schema.conversation.lastMessageAt, timestamp)),
+      ),
+    );
+
+  // Cliente voltou a escrever: resolvida/aguardando cliente reabrem (o webhook avisa o hub).
+  const reopened = await reopenOnClientMessage(db, conversationId);
+
+  // Fora da requisicao do webhook: o consumer baixa o arquivo. Se o envio falhar, a midia fica "pendente" (reenfileirada na reconciliacao).
+  if (parsed.media) await queue.send({ messageId });
+
+  // Codigo de campanha na mensagem: cria o negocio (ou registra o retorno). Falha aqui nunca desfaz a mensagem ja gravada.
+  const campaign = await tryCampaignCode(db, { contactId, conversationId, messageId, text: parsed.text, timestamp });
+  return { conversationId, messageId, reopened, campaign };
+}
